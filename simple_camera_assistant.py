@@ -11,16 +11,13 @@ import numpy as np
 import tempfile
 import time
 from datetime import datetime
-import subprocess
-import platform
 
 # Import TensorFlow and Keras
 from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
 from tensorflow.keras.preprocessing.image import img_to_array
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Model
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.layers import GlobalAveragePooling2D
 
 # Import text-to-speech only (no speech recognition)
@@ -44,38 +41,10 @@ class SimpleCameraAssistant:
         self.mapping = None
         
         # Voice component (text-to-speech only)
-        self.tts_engine = None
-        # Force pyttsx3 as primary TTS engine. If initialization fails, we will
-        # not fall back to PowerShell automatically to avoid mixed backends.
-        try:
-            # On Windows, prefer sapi5 for best voices
-            if platform.system().lower().startswith('win'):
-                try:
-                    self.tts_engine = pyttsx3.init('sapi5')
-                except Exception:
-                    # fallback to default init
-                    self.tts_engine = pyttsx3.init()
-            else:
-                self.tts_engine = pyttsx3.init()
-
-            # Setup voice and test quickly
-            self.setup_english_voice()
-            try:
-                self.tts_engine.say('')
-                self.tts_engine.runAndWait()
-            except Exception:
-                # If engine cannot run, mark as not available
-                print('pyttsx3 engine initialized but runAndWait failed')
-                self.tts_engine = None
-        except Exception as e:
-            print(f"pyttsx3 init error: {e}")
-            self.tts_engine = None
-
-        # Configure speak timing to avoid overlapping audio
-        # small delay before/after each speak and longer pause between messages
-        self.speak_pre_delay = 0.05
-        self.speak_post_delay = 0.05
-        self.speak_between_pause = 0.6
+        self.tts_engine = pyttsx3.init()
+        
+        # Setup voice
+        self.setup_english_voice()
         
         # Load trained model and data
         self.load_model_and_data()
@@ -99,68 +68,22 @@ class SimpleCameraAssistant:
                 print("English voice configured successfully")
         except Exception as e:
             print(f"Voice setup error: {e}")
-
-    def powershell_speak(self, text):
-        """Fallback TTS using Windows PowerShell System.Speech.Synthesis.SpeechSynthesizer
-
-        This uses PowerShell to invoke the .NET System.Speech API which is available
-        on most Windows systems and works without extra Python packages.
-        """
-        try:
-            # Use PowerShell to speak text using System.Speech
-            # Escape double quotes in the text
-            safe_text = text.replace('"', '`"')
-            ps_script = (
-                "Add-Type -AssemblyName System.speech;"
-                f"$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-                "$s.SelectVoiceAsync((Get-Culture).Name) > $null;"
-                f"$s.Speak(\"{safe_text}\");"
-            )
-            subprocess.run(["powershell", "-Command", ps_script], check=False)
-        except Exception as e:
-            # If even PowerShell fails, just print the message
-            print(f"Fallback TTS error: {e}")
     
     def speak(self, text):
         """Convert text to speech"""
-        # Always print to terminal for debugging/visual feedback
         print(f"Speaking: {text}")
-        # Add a tiny pre-delay to ensure audio subsystem is ready
-        try:
-            time.sleep(self.speak_pre_delay)
-        except Exception:
-            pass
-
-        # If pyttsx3 engine is available, use it (preferred)
-        if self.tts_engine is not None:
-            try:
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-                try:
-                    time.sleep(self.speak_post_delay)
-                except Exception:
-                    pass
-                return
-            except Exception as e:
-                print(f"pyttsx3 speak error: {e}")
-
-        # If pyttsx3 not available, inform user and fallback to printing
-        print("TTS engine not available (pyttsx3). Please install pyttsx3 or check audio settings.")
-        print(text)
+        self.tts_engine.say(text)
+        self.tts_engine.runAndWait()
     
     def speak_with_delay(self, text, delay=0.5):
         """Speak text with a small delay"""
         self.speak(text)
-        # Use configured between-message pause if available
-        try:
-            time.sleep(self.speak_between_pause if delay is None else delay)
-        except Exception:
-            time.sleep(0.6)
+        time.sleep(delay)
     
     def speak_multiple(self, texts):
         """Speak multiple texts with delays between them"""
         for text in texts:
-            self.speak_with_delay(text, self.speak_between_pause)
+            self.speak_with_delay(text, 0.3)
     
     def load_model_and_data(self):
         """Load the trained model and data"""
@@ -170,12 +93,48 @@ class SimpleCameraAssistant:
                 self.features = pickle.load(f)
             print(f"Loaded features for {len(self.features)} images")
             
-            # Load VGG16 base and add Global Average Pooling so output is a (512,) vector
-            base = VGG16(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
-            x = base.output
-            x = GlobalAveragePooling2D()(x)  # -> (None, 512)
-            self.model = Model(inputs=base.inputs, outputs=x)
-            print("VGG16 + GAP model loaded successfully (output dim 512)")
+            # Load feature extractor (VGG16) and apply global average pooling
+            vgg = VGG16(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+            self.model = Model(inputs=vgg.inputs, outputs=GlobalAveragePooling2D()(vgg.output))
+            print("VGG16 feature extractor (GlobalAveragePooling) loaded successfully")
+
+            # Try to load captioning model (.keras preferred, then .h5)
+            self.caption_model = None
+            try:
+                if os.path.exists('best_model.keras'):
+                    print("Found 'best_model.keras' — attempting to load caption model...")
+                    self.caption_model = load_model('best_model.keras', compile=False)
+                    print("Caption model loaded from best_model.keras")
+                elif os.path.exists('best_model.h5'):
+                    print("Found 'best_model.h5' — attempting to load caption model...")
+                    self.caption_model = load_model('best_model.h5', compile=False)
+                    print("Caption model loaded from best_model.h5")
+                else:
+                    print("No caption model file found (best_model.keras or best_model.h5). Using fallback descriptions")
+
+                # Try to load tokenizer and max_length if saved
+                try:
+                    if os.path.exists('tokenizer.pkl'):
+                        with open('tokenizer.pkl', 'rb') as f:
+                            self.tokenizer = pickle.load(f)
+                        print('Loaded tokenizer.pkl')
+                    if os.path.exists('max_length.pkl'):
+                        with open('max_length.pkl', 'rb') as f:
+                            self.max_length = pickle.load(f)
+                        print(f'Loaded max_length.pkl: {self.max_length}')
+                except Exception as e:
+                    print(f'Could not load tokenizer/max_length: {e}')
+
+                if self.caption_model is not None:
+                    try:
+                        self.caption_model.summary()
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                print(f"Could not load caption model: {e}")
+                print("Caption model will be disabled and the assistant will use the demo fallback descriptions")
+                self.caption_model = None
             
             # Load captions
             with open('input/captions.txt', 'r') as f:
@@ -206,22 +165,6 @@ class SimpleCameraAssistant:
             self.max_length = max(len(text.split()) for text in img_desc)
             
             print(f"Loaded {len(self.mapping)} images with captions")
-
-            # Try to load a trained caption model if present
-            try:
-                if os.path.exists('best_model.h5'):
-                    print('Found best_model.h5 — attempting to load caption model')
-                    try:
-                        self.caption_model = load_model('best_model.h5')
-                        print('Caption model loaded successfully')
-                    except Exception as e:
-                        print(f'Could not load caption model (best_model.h5): {e}')
-                        self.caption_model = None
-                else:
-                    self.caption_model = None
-            except Exception as e:
-                print(f'Error checking/loading caption model: {e}')
-                self.caption_model = None
             
         except Exception as e:
             print(f"Error loading model and data: {e}")
@@ -280,12 +223,9 @@ class SimpleCameraAssistant:
         """Extract features using VGG16"""
         try:
             features = self.model.predict(image, verbose=0)
-            # Ensure we return a 1-D vector (1,512) -> (512,) for nearest neighbor
-            import numpy as _np
-            arr = _np.array(features)
-            if arr.ndim > 2:
-                arr = arr.reshape((arr.shape[0], -1))
-            return arr
+            # The feature extractor now outputs a pooled vector (1,512).
+            # Some caption models expect (1,512) vectors, others may expect maps — adapt if needed.
+            return features
         except Exception as e:
             print(f"Feature extraction error: {e}")
             return None
@@ -293,12 +233,12 @@ class SimpleCameraAssistant:
     def predict_description(self, features):
         """Generate description from features"""
         try:
-            # Prefer nearest-neighbor caption using precomputed features if available
-            nn_caption = self.nearest_caption(features)
-            if nn_caption:
-                return nn_caption
+            # If a trained caption model is loaded, use it (greedy decoding)
+            if hasattr(self, 'caption_model') and self.caption_model is not None:
+                caption = self.generate_caption(features)
+                return caption
 
-            # If no nearest caption, fall back to a small set of generic sentences
+            # Fallback: Simple demo descriptions (no trained caption model)
             descriptions = [
                 "A person is looking at the camera",
                 "There is an object in the view",
@@ -308,55 +248,10 @@ class SimpleCameraAssistant:
             ]
             import random
             return random.choice(descriptions)
-
+            
         except Exception as e:
             print(f"Description prediction error: {e}")
             return "Unable to generate description"
-
-    def nearest_caption(self, features_vec):
-        """Return a caption from the nearest image in the precomputed feature set.
-
-        features_vec: numpy array of shape (1, D) or (D,)
-        """
-        try:
-            if self.features is None or not isinstance(self.features, dict):
-                return None
-
-            # Normalize input vector
-            import numpy as _np
-            v = _np.array(features_vec)
-            if v.ndim == 2 and v.shape[0] == 1:
-                v = v.reshape(-1)
-
-            # Build matrix of features (N, D) — make sure all rows are 1D vectors
-            keys = list(self.features.keys())
-            rows = []
-            for k in keys:
-                fv = _np.array(self.features[k])
-                fv = fv.reshape(-1)
-                rows.append(fv)
-            mats = _np.vstack(rows)
-
-            # Normalize
-            mats_norm = _np.linalg.norm(mats, axis=1)
-            v_norm = _np.linalg.norm(v)
-            if v_norm == 0 or mats_norm.sum() == 0:
-                return None
-
-            sims = mats.dot(v) / (mats_norm * (v_norm + 1e-10))
-            best_idx = int(_np.argmax(sims))
-            best_key = keys[best_idx]
-
-            # Return one of the captions for this key (choose the first or random)
-            caps = self.mapping.get(best_key, [])
-            if not caps:
-                return None
-            # Prefer deterministic selection: choose the first caption
-            caption = caps[0]
-            return caption
-        except Exception as e:
-            print(f"Nearest caption error: {e}")
-            return None
     
     def clean_description(self, text):
         """Clean up generated description"""
@@ -368,6 +263,68 @@ class SimpleCameraAssistant:
             text = text[0].upper() + text[1:]
         
         return text
+
+    def generate_caption(self, photo_features):
+        """Generate a caption from photo features using the loaded caption model.
+
+        This implements a simple greedy decode and supports a common
+        architecture where the caption model expects two inputs:
+        [photo_features, input_sequence]. If your trained model uses a
+        different input signature you may need to adapt this function.
+        """
+        try:
+            if self.caption_model is None:
+                return "No caption model available"
+
+            # Ensure photo_features is in batch form (1, ...)
+            if len(photo_features.shape) == 3:
+                # e.g., (7,7,512) -> expand to (1,7,7,512)
+                photo = np.expand_dims(photo_features, axis=0)
+            else:
+                photo = photo_features
+
+            # Use the tokens used during training: 'beginning' and 'ending'
+            in_text = 'beginning'
+            for i in range(self.max_length if self.max_length is not None else 34):
+                sequence = self.tokenizer.texts_to_sequences([in_text])[0]
+                sequence = pad_sequences([sequence], maxlen=self.max_length)
+
+                # Decide how to call the model based on its inputs
+                try:
+                    n_inputs = len(self.caption_model.inputs)
+                except Exception:
+                    n_inputs = 1
+
+                if n_inputs == 2:
+                    # caption model expects [photo_vector, sequence]
+                    # Ensure photo is shape (1, features)
+                    try:
+                        yhat = self.caption_model.predict([photo, sequence], verbose=0)
+                    except Exception:
+                        # Some models expect the photo vector flattened
+                        yhat = self.caption_model.predict([np.reshape(photo, (photo.shape[0], -1)), sequence], verbose=0)
+                else:
+                    # Try calling with photo first, otherwise with sequence
+                    try:
+                        yhat = self.caption_model.predict(photo, verbose=0)
+                    except Exception:
+                        yhat = self.caption_model.predict(sequence, verbose=0)
+
+                # yhat might be (1, vocab_size) or similar
+                yhat_idx = np.argmax(yhat)
+                word = self.tokenizer.index_word.get(yhat_idx)
+                if word is None:
+                    break
+                in_text += ' ' + word
+                if word == 'ending':
+                    break
+
+            # Clean 'beginning'/'ending' tokens
+            return in_text.replace('beginning', '').replace('ending', '').strip()
+
+        except Exception as e:
+            print(f"Caption generation error: {e}")
+            return "Unable to generate description"
     
     def describe_camera_view(self):
         """Describe current camera view"""
@@ -416,18 +373,26 @@ class SimpleCameraAssistant:
         ]
         self.speak_multiple(welcome_messages)
         
-        # Let user probe and select which camera index to use (helps identify front/back cameras)
-        chosen_index = self.select_camera_interactively(max_index=4)
-        if chosen_index is None:
-            self.speak("No camera selected. Exiting the assistant.")
-            print("No camera selected. Exiting.")
-            return
-
-        if self.initialize_camera(chosen_index):
-            self.speak(f"Using camera index {chosen_index}")
-        else:
-            self.speak(f"Failed to open camera index {chosen_index}. Exiting.")
-            print(f"Failed to open camera index {chosen_index}")
+        # Initialize camera with detailed feedback
+        camera_initialized = False
+        for camera_index in [0, 1, 2]:
+            self.speak(f"Trying to connect to camera number {camera_index + 1}")
+            if self.initialize_camera(camera_index):
+                camera_initialized = True
+                self.speak(f"Camera number {camera_index + 1} connected successfully")
+                break
+            else:
+                self.speak(f"Camera number {camera_index + 1} not available")
+        
+        if not camera_initialized:
+            error_messages = [
+                "No camera detected on your system",
+                "Please check your camera connection",
+                "Make sure no other programs are using the camera",
+                "Then restart this program"
+            ]
+            self.speak_multiple(error_messages)
+            print("No camera detected. Please check your camera connection.")
             return
         
         # Ready messages
@@ -536,91 +501,6 @@ class SimpleCameraAssistant:
             self.speak("Unable to access camera")
             self.speak("Please check camera connection and try again")
             return False
-
-    def probe_cameras(self, max_index=4, show_preview=False):
-        """Probe available camera indices up to max_index.
-
-        For each index that opens, capture one frame, report resolution and save
-        a temporary snapshot so the user can visually identify front/back camera.
-        Returns a list of available camera indices.
-        """
-        available = []
-        tmpdir = tempfile.gettempdir()
-        self.speak(f"Probing cameras from index zero to {max_index}")
-        for idx in range(0, max_index + 1):
-            try:
-                cap = cv2.VideoCapture(idx)
-                if not cap or not cap.isOpened():
-                    print(f"Camera {idx}: not available")
-                    cap.release()
-                    continue
-
-                # Try to grab a frame
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    print(f"Camera {idx}: opened but no frame")
-                    self.speak(f"Camera {idx} opened but no image received")
-                    cap.release()
-                    continue
-
-                h, w = frame.shape[:2]
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                info = f"Camera index {idx} available, resolution {w} by {h}, fps approx {int(fps) if fps>0 else 'unknown'}"
-                print(info)
-                self.speak(info)
-
-                # Save a snapshot so user can inspect image files if needed
-                snapshot_path = os.path.join(tmpdir, f"camera_{idx}_snapshot.jpg")
-                try:
-                    cv2.imwrite(snapshot_path, frame)
-                    print(f"Saved snapshot: {snapshot_path}")
-                except Exception as e:
-                    print(f"Could not save snapshot for camera {idx}: {e}")
-
-                # Optionally show a brief preview window so user can see which camera it is
-                if show_preview:
-                    winname = f"Camera {idx} preview"
-                    cv2.namedWindow(winname, cv2.WINDOW_NORMAL)
-                    cv2.imshow(winname, frame)
-                    cv2.waitKey(1000)  # show for 1 second
-                    cv2.destroyWindow(winname)
-
-                available.append({'index': idx, 'width': w, 'height': h, 'fps': fps, 'snapshot': snapshot_path})
-                cap.release()
-            except Exception as e:
-                print(f"Error probing camera {idx}: {e}")
-        if not available:
-            self.speak("No cameras found during probe")
-        return available
-
-    def select_camera_interactively(self, max_index=4):
-        """Probe cameras and let the user choose which index to use.
-
-        Returns the chosen camera index or None if none selected.
-        """
-        available = self.probe_cameras(max_index=max_index, show_preview=True)
-        if not available:
-            return None
-
-        print("Available cameras:")
-        for cam in available:
-            print(f"- Index {cam['index']}: {cam['width']}x{cam['height']}, snapshot: {cam['snapshot']}")
-
-        self.speak("Please enter the camera index you want to use, or press Enter to use the first available camera")
-        choice = input("Select camera index (or press Enter for first): ").strip()
-        if choice == "":
-            return available[0]['index']
-
-        try:
-            chosen = int(choice)
-            if any(cam['index'] == chosen for cam in available):
-                return chosen
-            else:
-                print("Chosen index not in available list. Using first available.")
-                return available[0]['index']
-        except ValueError:
-            print("Invalid input. Using first available camera.")
-            return available[0]['index']
     
     def quick_test(self):
         """Quick test - capture and describe"""
